@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 DB_PATH = Path("hoopstats.db")
 
@@ -8,7 +8,7 @@ DB_PATH = Path("hoopstats.db")
 # ============================================================
 # CONNECTION
 # ============================================================
-def conn():
+def conn() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)
     c.execute("PRAGMA foreign_keys = ON;")
     return c
@@ -17,7 +17,7 @@ def conn():
 # ============================================================
 # INIT DB
 # ============================================================
-def init_db():
+def init_db() -> None:
     c = conn()
     cur = c.cursor()
 
@@ -118,7 +118,7 @@ def is_user_pro(user_id: int) -> bool:
     return bool(row and int(row[0]) == 1)
 
 
-def set_user_pro(user_id: int, is_pro: bool = True):
+def set_user_pro(user_id: int, is_pro: bool = True) -> None:
     c = conn()
     c.execute(
         "UPDATE users SET is_pro = ? WHERE id = ?",
@@ -131,7 +131,7 @@ def set_user_pro(user_id: int, is_pro: bool = True):
 # ============================================================
 # GAMES
 # ============================================================
-def list_games(user_id: int):
+def list_games(user_id: int) -> List[Tuple[int, str, str]]:
     c = conn()
     rows = c.execute(
         "SELECT id, name, created_at FROM games WHERE user_id = ? ORDER BY id DESC",
@@ -154,7 +154,7 @@ def create_game(user_id: int, name: str) -> int:
     return game_id
 
 
-def delete_game(user_id: int, game_id: int):
+def delete_game(user_id: int, game_id: int) -> None:
     c = conn()
     c.execute(
         "DELETE FROM games WHERE id = ? AND user_id = ?",
@@ -167,7 +167,7 @@ def delete_game(user_id: int, game_id: int):
 # ============================================================
 # ROSTERS / STATS
 # ============================================================
-def set_roster(game_id: int, roster: list, stat_keys: list):
+def set_roster(game_id: int, roster: List[str], stat_keys: List[str]) -> None:
     c = conn()
     cur = c.cursor()
 
@@ -180,12 +180,14 @@ def set_roster(game_id: int, roster: list, stat_keys: list):
     new_set = set(roster)
     old_set = set(existing_by_name.keys())
 
+    # remove players not in new roster
     for name in (old_set - new_set):
         cur.execute(
             "DELETE FROM players WHERE game_id = ? AND name = ?",
             (game_id, name)
         )
 
+    # add missing players
     for name in roster:
         if name not in existing_by_name:
             cur.execute(
@@ -193,6 +195,7 @@ def set_roster(game_id: int, roster: list, stat_keys: list):
                 (game_id, name)
             )
 
+    # ensure stat rows exist
     players = cur.execute(
         "SELECT id FROM players WHERE game_id = ? ORDER BY id",
         (game_id,)
@@ -209,7 +212,7 @@ def set_roster(game_id: int, roster: list, stat_keys: list):
     c.close()
 
 
-def load_game(game_id: int, stat_keys: list):
+def load_game(game_id: int, stat_keys: List[str]):
     c = conn()
     cur = c.cursor()
 
@@ -221,7 +224,7 @@ def load_game(game_id: int, stat_keys: list):
     roster = [name for _, name in players]
     name_to_pid = {name: pid for pid, name in players}
 
-    stats_by_player = {}
+    stats_by_player: Dict[str, Dict[str, int]] = {}
     for pid, name in players:
         rows = cur.execute("""
             SELECT stat_key, stat_value
@@ -237,7 +240,7 @@ def load_game(game_id: int, stat_keys: list):
     return roster, name_to_pid, stats_by_player
 
 
-def apply_change(game_id: int, player_id: int, change: dict, direction: int = 1):
+def apply_change(game_id: int, player_id: int, change: Dict[str, int], direction: int = 1) -> None:
     c = conn()
     cur = c.cursor()
 
