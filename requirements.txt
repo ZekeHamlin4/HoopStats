@@ -2,3 +2,4 @@ streamlit
 stripe
 reportlab
 pillow
+pandas
