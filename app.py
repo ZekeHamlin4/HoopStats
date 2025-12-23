@@ -293,7 +293,14 @@ email_now = current_user_email()
 if not email_now:
     st.sidebar.subheader("Account")
     if has_login:
-        st.sidebar.button("Log in with Google", key="login_google", use_container_width=True, on_click=st.login)
+        if st.sidebar.button("Log in with Google", key="login_google", use_container_width=True):
+            try:
+                st.login()
+            except Exception:
+                st.sidebar.error(
+                    "Google login isn’t configured on Streamlit Cloud for this app yet. "
+                    "Use the Email fallback below for now (or set up Auth in Manage app → Settings → Authentication)."
+                )
 
     st.sidebar.caption("Local dev fallback:")
     local_email = st.sidebar.text_input("Email", value=st.session_state.email).strip().lower()
