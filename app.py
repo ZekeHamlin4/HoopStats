@@ -1,658 +1,1118 @@
 import os
-import time
-import sqlite3
-import streamlit as st
-import stripe
-
-from typing import Optional
-
-from db import init_db, list_games, create_game, delete_game, set_roster, load_game, apply_change
-
 import csv
 import io
 import tempfile
+from datetime import datetime
+
+import streamlit as st
+import stripe
+import pandas as pd
+
+# --- Keep this (you liked it) ---
+st.sidebar.caption("✅ Google login active")
 
 from reportlab.lib.pagesizes import LETTER
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
+from db import (
+    init_db,
+    get_or_create_user,
+    is_user_pro,
+    set_user_pro,
+    list_games,
+    create_game,
+    delete_game,
+    set_roster,
+    load_game,
+    apply_change,
+)
 
-# ------------------
-# App constants
-# ------------------
-STAT_KEYS = ["2PM","2PA","3PM","3PA","FTM","FTA","OREB","DREB","AST","TOV"]
-DEFAULT_ROSTER = ["Player 1","Player 2","Player 3","Player 4","Player 5"]
+# ============================================================
+# CONFIG
+# ============================================================
+STAT_KEYS = ["2PM","2PA","3PM","3PA","FTM","FTA","OREB","DREB","AST","TOV","STL","BLK","PF"]
 
-DB_PATH = "hoopstats.db"
+DEFAULT_HOME = ["Player 1","Player 2","Player 3","Player 4","Player 5"]
+DEFAULT_AWAY = ["Opponent 1","Opponent 2","Opponent 3","Opponent 4","Opponent 5"]
+
 LOGO_PATH = "logo.png"
 FAVICON_PATH = "favicon.png"
 
-# Admin bypass: set in Terminal like:
-# export ADMIN_EMAILS="you@example.com,coach@example.com"
-ADMIN_EMAILS_RAW = os.getenv("ADMIN_EMAILS", "")
-ADMIN_EMAILS = {e.strip().lower() for e in ADMIN_EMAILS_RAW.split(",") if e.strip()}
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
 
+# Stripe env (set these when you’re ready)
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")  # subscription price id
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:8501/?upgraded=1")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "http://localhost:8501/?canceled=1")
 
-def empty_player_stats():
-    return {k: 0 for k in STAT_KEYS}
+HOME_PREFIX = "HOME::"
+AWAY_PREFIX = "AWAY::"
 
-def pct(m, a):
-    return round((m / a) * 100, 1) if a else 0.0
+PERIODS = ["Q1", "Q2", "Q3", "Q4", "OT"]
 
+# ============================================================
+# HELPERS
+# ============================================================
+def pct(m, a): return round((m / a) * 100, 1) if a else 0.0
+def points(s): return int(s["2PM"])*2 + int(s["3PM"])*3 + int(s["FTM"])
+def fgm(s): return int(s["2PM"]) + int(s["3PM"])
+def fga(s): return int(s["2PA"]) + int(s["3PA"])
+def total_reb(s): return int(s["OREB"]) + int(s["DREB"])
 
-# ------------------
-# Page config (MUST be first Streamlit call)
-# ------------------
-page_icon = FAVICON_PATH if os.path.exists(FAVICON_PATH) else "🏀"
-st.set_page_config(page_title="HoopStats", page_icon=page_icon, layout="wide")
+def team_totals(roster, stats):
+    t = {k: 0 for k in STAT_KEYS}
+    for name in roster:
+        for k in STAT_KEYS:
+            t[k] += int(stats[name].get(k, 0))
+    return t
 
+def clean_name(n: str) -> str:
+    if n.startswith(HOME_PREFIX): return n[len(HOME_PREFIX):]
+    if n.startswith(AWAY_PREFIX): return n[len(AWAY_PREFIX):]
+    return n
 
-# ------------------
-# Stripe config (READ FROM TERMINAL ENV VARS)
-# ------------------
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")          # sk_test_... or sk_live_...
-PRICE_ID = os.getenv("STRIPE_PRICE_ID")                  # price_...
-APP_URL = os.getenv("APP_URL", "http://localhost:8501")  # localhost for now
+def team_of(n: str) -> str:
+    if n.startswith(HOME_PREFIX): return "Home"
+    if n.startswith(AWAY_PREFIX): return "Away"
+    return "Home"  # fallback for older one-team games
 
+def add_prefix(team: str, player_name: str) -> str:
+    player_name = player_name.strip()
+    if not player_name:
+        return ""
+    if player_name.startswith(HOME_PREFIX) or player_name.startswith(AWAY_PREFIX):
+        return player_name
+    return (HOME_PREFIX if team == "Home" else AWAY_PREFIX) + player_name
 
-# ------------------
-# Local user DB (for Pro persistence)
-# ------------------
-def user_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            stripe_customer_id TEXT,
-            plan TEXT DEFAULT 'free',
-            last_checked INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    return conn
+def is_both_teams_game(roster):
+    return any(n.startswith(HOME_PREFIX) for n in roster) and any(n.startswith(AWAY_PREFIX) for n in roster)
 
-def normalize_email(email: str) -> str:
-    return (email or "").strip().lower()
-
-def upsert_user(email: str, customer_id: Optional[str] = None, plan: Optional[str] = None):
-    email = normalize_email(email)
-    if not email:
-        return
-    conn = user_db()
-    cur = conn.cursor()
-    cur.execute("SELECT email FROM users WHERE email=?", (email,))
-    exists = cur.fetchone() is not None
-    now = int(time.time())
-
-    if not exists:
-        cur.execute(
-            "INSERT INTO users(email, stripe_customer_id, plan, last_checked) VALUES (?, ?, ?, ?)",
-            (email, customer_id, plan or "free", 0)
-        )
-    else:
-        if customer_id is not None:
-            cur.execute("UPDATE users SET stripe_customer_id=? WHERE email=?", (customer_id, email))
-        if plan is not None:
-            cur.execute("UPDATE users SET plan=?, last_checked=? WHERE email=?", (plan, now, email))
-
-    conn.commit()
-
-def get_user(email: str):
-    email = normalize_email(email)
-    if not email:
-        return None
-    conn = user_db()
-    cur = conn.cursor()
-    cur.execute("SELECT email, stripe_customer_id, plan, last_checked FROM users WHERE email=?", (email,))
-    row = cur.fetchone()
-    if not row:
-        return None
-    return {"email": row[0], "customer_id": row[1], "plan": row[2], "last_checked": row[3]}
-
-def set_last_checked(email: str):
-    email = normalize_email(email)
-    if not email:
-        return
-    conn = user_db()
-    conn.execute("UPDATE users SET last_checked=? WHERE email=?", (int(time.time()), email))
-    conn.commit()
-
-def set_plan(email: str, plan: str):
-    upsert_user(email, plan=plan)
-
-def verify_subscription_for_user(email: str, cache_seconds: int = 300) -> str:
+def current_user_email():
     """
-    Returns 'pro' or 'free' by checking Stripe subscriptions for the user's customer.
-    Uses a small cache in SQLite to avoid hammering Stripe.
+    Hosted (Streamlit auth): uses st.user if available.
+    Local fallback: stored email in session_state.
     """
-    email = normalize_email(email)
-    if not email:
-        return "free"
+    u = getattr(st, "user", None)
+    if u is not None:
+        email = getattr(u, "email", "") or (u.get("email") if hasattr(u, "get") else "")
+        email = (email or "").strip().lower()
+        if email:
+            return email
+    return (st.session_state.get("email") or "").strip().lower()
 
-    u = get_user(email)
-    if not u or not u.get("customer_id"):
-        return u["plan"] if u else "free"
+# --- Action labels + point values (for log + runs) ---
+ACTION_LABELS = {
+    "2PM": "✅ 2PT Made",
+    "2PA": "❌ 2PT Miss",
+    "3PM": "✅ 3PT Made",
+    "3PA": "❌ 3PT Miss",
+    "FTM": "✅ FT Made",
+    "FTA": "❌ FT Miss",
+    "OREB": "OREB +1",
+    "DREB": "DREB +1",
+    "AST": "AST +1",
+    "TOV": "TOV +1",
+    "STL": "STL +1",
+    "BLK": "BLK +1",
+    "PF":  "FOUL +1",
+}
+def change_points(change: dict) -> int:
+    # points only from made shots
+    return int(change.get("2PM", 0))*2 + int(change.get("3PM", 0))*3 + int(change.get("FTM", 0))*1
 
-    if not stripe.api_key:
-        return u["plan"]
+def nice_change_label(change: dict) -> str:
+    # best-effort label for common combos
+    keys = {k for k, v in change.items() if int(v) != 0}
+    if keys == {"2PM","2PA","FTM","FTA"}:
+        return "⭐ And-1 (2PT + FT)"
+    if keys == {"3PA","FTA"}:
+        return "⭐ 3-Foul (3PA + FT)"
+    if keys == {"DREB","AST"}:
+        return "⭐ DREB + AST"
+    if keys == {"OREB","2PM","2PA"}:
+        return "⭐ OREB + 2PT"
+    # single-stat fallback
+    if len(keys) == 1:
+        k = list(keys)[0]
+        return ACTION_LABELS.get(k, f"{k} +1")
+    # otherwise show a short summary
+    parts = []
+    for k in ["2PM","2PA","3PM","3PA","FTM","FTA","OREB","DREB","AST","TOV","STL","BLK","PF"]:
+        if k in keys:
+            parts.append(k)
+    return " + ".join(parts)[:45]
 
-    now = int(time.time())
-    if u["last_checked"] and (now - u["last_checked"] < cache_seconds):
-        return u["plan"]
+def format_scoreline(home_score, away_score):
+    return f"{home_score}–{away_score}"
 
-    customer_id = u["customer_id"]
+def compute_takeaways(home_roster, away_roster, stats):
+    # simple “story” comparisons
+    th = team_totals(home_roster, stats) if home_roster else {k:0 for k in STAT_KEYS}
+    ta = team_totals(away_roster, stats) if away_roster else {k:0 for k in STAT_KEYS}
 
-    try:
-        subs = stripe.Subscription.list(customer=customer_id, status="active", limit=25)
-        is_pro = False
+    home_reb = th["OREB"] + th["DREB"]
+    away_reb = ta["OREB"] + ta["DREB"]
+    reb_diff = home_reb - away_reb
 
-        if PRICE_ID:
-            for s in subs.data:
-                for item in (s["items"]["data"] or []):
-                    if item["price"]["id"] == PRICE_ID:
-                        is_pro = True
-                        break
-                if is_pro:
-                    break
-        else:
-            is_pro = len(subs.data) > 0
+    home_tov = th["TOV"]
+    away_tov = ta["TOV"]
+    tov_diff = away_tov - home_tov  # “forced” feel if away has more
 
-        plan = "pro" if is_pro else "free"
-        set_plan(email, plan)
-        set_last_checked(email)
-        return plan
-    except Exception:
-        return u["plan"]
+    home_3p_pct = pct(th["3PM"], th["3PA"])
+    away_3p_pct = pct(ta["3PM"], ta["3PA"])
 
+    home_ft_pct = pct(th["FTM"], th["FTA"])
+    away_ft_pct = pct(ta["FTM"], ta["FTA"])
 
-# ------------------
-# Initialize your stats DB (from db.py)
-# ------------------
+    items = []
+    if reb_diff != 0:
+        lead = "Home" if reb_diff > 0 else "Away"
+        items.append(f"{lead} +{abs(reb_diff)} REB advantage")
+    if tov_diff != 0:
+        lead = "Home" if tov_diff > 0 else "Away"
+        items.append(f"{lead} forced {abs(tov_diff)} more TOV")
+    if th["3PA"] >= 3 or ta["3PA"] >= 3:
+        lead = "Home" if home_3p_pct > away_3p_pct else "Away"
+        items.append(f"{lead} better from 3 ({home_3p_pct}% vs {away_3p_pct}%)")
+    if th["FTA"] >= 3 or ta["FTA"] >= 3:
+        lead = "Home" if home_ft_pct > away_ft_pct else "Away"
+        items.append(f"{lead} better at FT ({home_ft_pct}% vs {away_ft_pct}%)")
+
+    # cap to 3 for clean UI
+    return items[:3]
+
+def leaders_from_roster(roster_list, stats):
+    # returns dict of leader rows for PTS/REB/AST
+    if not roster_list:
+        return {"PTS": None, "REB": None, "AST": None}
+
+    def statline(name):
+        s = stats[name]
+        return {
+            "name": clean_name(name),
+            "PTS": points(s),
+            "REB": total_reb(s),
+            "AST": int(s["AST"]),
+            "TOV": int(s["TOV"]),
+            "FGM": fgm(s),
+            "FGA": fga(s),
+            "3PM": int(s["3PM"]),
+            "3PA": int(s["3PA"]),
+            "FTM": int(s["FTM"]),
+            "FTA": int(s["FTA"]),
+        }
+
+    lines = [statline(n) for n in roster_list]
+    pts = max(lines, key=lambda x: x["PTS"])
+    reb = max(lines, key=lambda x: x["REB"])
+    ast = max(lines, key=lambda x: x["AST"])
+    return {"PTS": pts, "REB": reb, "AST": ast}
+
+def runs_from_log(log_entries, team: str, last_n: int = 6):
+    # “Run” = points in last N scoring events (simple & fast)
+    if not log_entries:
+        return 0
+    pts = 0
+    count = 0
+    for e in reversed(log_entries):
+        if e.get("pts", 0) <= 0:
+            continue
+        count += 1
+        if e.get("team") == team:
+            pts += int(e.get("pts", 0))
+        if count >= last_n:
+            break
+    return pts
+
+# ============================================================
+# PAGE SETUP / STYLE (removes the “top bar” look you hated)
+# ============================================================
+st.set_page_config(
+    page_title="HoopStats",
+    page_icon=FAVICON_PATH if os.path.exists(FAVICON_PATH) else "🏀",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+      /* tighter + cleaner */
+      .block-container { padding-top: 0.6rem; padding-bottom: 2rem; max-width: 1400px; }
+
+      /* button feel */
+      div.stButton > button {
+        padding: 0.9rem 1.0rem;
+        font-weight: 800;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.08);
+      }
+
+      /* metrics typography */
+      div[data-testid="stMetricValue"] { font-size: 1.75rem; }
+      div[data-testid="stMetricLabel"] { font-size: 0.9rem; opacity: 0.9; }
+
+      .subtle { opacity: 0.82; font-size: 0.93rem; }
+
+      /* make sidebar feel like an app nav */
+      section[data-testid="stSidebar"] { padding-top: 0.6rem; }
+
+      /* slightly bigger tabs/nav labels */
+      .stRadio label { font-size: 0.98rem; }
+
+      /* hide Streamlit default footer */
+      footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 init_db()
 
-st.title("HoopStats – Live Stat Tracker (Saved Games)")
-
-
-# ------------------
-# Sidebar: Logo + Branding
-# ------------------
+# ============================================================
+# SIDEBAR BRANDING
+# ============================================================
 if os.path.exists(LOGO_PATH):
     st.sidebar.image(LOGO_PATH, use_container_width=True)
 
 st.sidebar.markdown("## 🏀 HoopStats")
-st.sidebar.caption("Live stat tracking + Pro exports")
+st.sidebar.caption("Fast live stat tracking")
 st.sidebar.divider()
 
+# ============================================================
+# LOGIN (keep stable)
+# ============================================================
+has_login = hasattr(st, "login") and callable(getattr(st, "login"))
+has_logout = hasattr(st, "logout") and callable(getattr(st, "logout"))
 
-# ------------------
-# Sidebar: Account (email) + Pro persistence
-# ------------------
-st.sidebar.header("Account")
+st.session_state.setdefault("email", "")
+email_now = current_user_email()
 
-if "user_email" not in st.session_state:
-    st.session_state.user_email = ""
+if not email_now:
+    st.sidebar.subheader("Account")
+    if has_login:
+        st.sidebar.button("Log in with Google", key="login_google", use_container_width=True, on_click=st.login)
 
-email_input = st.sidebar.text_input(
-    "Email (to save Pro access)",
-    value=st.session_state.user_email,
-    placeholder="you@example.com"
-)
-email_norm = normalize_email(email_input)
-
-if st.sidebar.button("Save Email"):
-    st.session_state.user_email = email_norm
-    if email_norm:
-        upsert_user(email_norm)
-        st.sidebar.success("Saved ✅")
-    else:
-        st.sidebar.info("Cleared.")
-
-
-# ------------------
-# Handle Stripe redirect (success_url includes session_id)
-# ------------------
-if st.query_params.get("success") and st.query_params.get("session_id") and stripe.api_key:
-    session_id = st.query_params.get("session_id")
-    try:
-        session = stripe.checkout.Session.retrieve(session_id)
-        customer_id = session.get("customer")
-
-        customer_email = None
-        if session.get("customer_details") and session["customer_details"].get("email"):
-            customer_email = session["customer_details"]["email"]
-        if not customer_email and session.get("customer_email"):
-            customer_email = session.get("customer_email")
-
-        customer_email = normalize_email(customer_email)
-
-        if customer_email:
-            upsert_user(customer_email, customer_id=customer_id, plan="pro")
-            st.session_state.user_email = customer_email
-            st.sidebar.success("Payment successful! Pro unlocked 🎉 (saved to your email)")
-        else:
-            st.sidebar.warning("Payment succeeded, but I couldn’t read an email from the checkout session.")
-    except Exception:
-        st.sidebar.warning("Payment returned, but I couldn’t verify the session. Try refreshing or saving your email.")
-
-if st.query_params.get("canceled"):
-    st.sidebar.info("Checkout canceled.")
-
-
-# ------------------
-# Plan: determine current plan (persisted) + ADMIN BYPASS
-# ------------------
-current_plan = "free"
-admin_mode = (email_norm in ADMIN_EMAILS) if email_norm else False
-
-if admin_mode:
-    current_plan = "pro"
-else:
-    if email_norm:
-        u = get_user(email_norm) or {}
-        if u.get("customer_id"):
-            current_plan = verify_subscription_for_user(email_norm)
-        else:
-            current_plan = u.get("plan", "free")
-
-is_pro = (current_plan == "pro")
-
-if admin_mode:
-    st.sidebar.success("ADMIN MODE ✅ (Pro forced)")
-st.sidebar.write(f"Current plan: **{current_plan.upper()}**")
-
-
-# ------------------
-# Sidebar: Billing
-# ------------------
-st.sidebar.header("Billing")
-
-if not stripe.api_key or not PRICE_ID:
-    st.sidebar.caption("Stripe not configured (missing STRIPE_SECRET_KEY or STRIPE_PRICE_ID).")
-else:
-    if not is_pro:
-        if st.sidebar.button("Upgrade to Pro ($9.99/month)"):
-            checkout_kwargs = {
-                "mode": "subscription",
-                "line_items": [{"price": PRICE_ID, "quantity": 1}],
-                "success_url": f"{APP_URL}/?success=true&session_id={{CHECKOUT_SESSION_ID}}",
-                "cancel_url": f"{APP_URL}/?canceled=true",
-            }
-            if email_norm:
-                checkout_kwargs["customer_email"] = email_norm
-
-            session = stripe.checkout.Session.create(**checkout_kwargs)
-            st.sidebar.link_button("Open Stripe Checkout", session.url)
-    else:
-        u = get_user(email_norm) if email_norm else None
-        if u and u.get("customer_id"):
-            if st.sidebar.button("Manage subscription (Portal)"):
-                try:
-                    portal = stripe.billing_portal.Session.create(
-                        customer=u["customer_id"],
-                        return_url=APP_URL
-                    )
-                    st.sidebar.link_button("Open Customer Portal", portal.url)
-                except Exception:
-                    st.sidebar.warning("Could not open portal. Check your Stripe settings.")
-
-
-# ------------------
-# Tabs
-# ------------------
-tab_home, tab_live, tab_box, tab_export = st.tabs(["🏠 Home", "📊 Live", "📋 Box Score", "⬇️ Export"])
-
-with tab_home:
-    st.markdown("### Track basketball stats in real time — then export clean reports")
-    st.markdown(
-        """
-**HoopStats** is a lightweight stat tracker you can run on any laptop during games.
-
-**Free**
-- Live stat tracking
-- Saved games + roster
-- Box score view
-
-**Pro**
-- Export CSV
-- Export PDF
-- Pro access persists by email
-"""
-    )
-    st.markdown("#### Tip")
-    st.write("Enter your email in the sidebar so Pro access persists after checkout.")
-
-
-# ------------------
-# Sidebar: Games
-# ------------------
-st.sidebar.divider()
-st.sidebar.header("Games")
-
-games = list_games()
-game_labels = ["➕ Create new game..."] + [f"{gid}: {name}" for gid, name, _ in games]
-choice = st.sidebar.selectbox("Select game", game_labels, index=0)
-
-if "active_game_id" not in st.session_state:
-    st.session_state.active_game_id = None
-
-if choice == "➕ Create new game...":
-    new_name = st.sidebar.text_input("New game name", value="Team vs Opponent (Date)")
-    if st.sidebar.button("Create Game"):
-        gid = create_game(new_name.strip() or "New Game")
-        st.session_state.active_game_id = gid
-        st.toast("Game created ✅")
+    st.sidebar.caption("Local dev fallback:")
+    local_email = st.sidebar.text_input("Email", value=st.session_state.email).strip().lower()
+    if st.sidebar.button("Save Email", key="save_email"):
+        st.session_state.email = local_email
         st.rerun()
-else:
-    gid = int(choice.split(":")[0])
-    st.session_state.active_game_id = gid
 
-if st.session_state.active_game_id is None:
-    st.info("Create or select a game in the left sidebar to start.")
+    email_now = current_user_email()
+
+if not email_now:
+    st.title("HoopStats")
+    st.info("Log in to start tracking games.")
     st.stop()
 
-active_game_id = st.session_state.active_game_id
+user_id = get_or_create_user(email_now, name=email_now.split("@")[0])
 
-if st.sidebar.button("🗑️ Delete selected game"):
-    delete_game(active_game_id)
-    st.session_state.active_game_id = None
-    st.toast("Game deleted 🗑️")
-    st.rerun()
+is_admin = email_now in ADMIN_EMAILS
+if is_admin:
+    set_user_pro(user_id, True)
 
+is_pro = is_admin or is_user_pro(user_id)
 
-# ------------------
-# Load game data
-# ------------------
-if "history" not in st.session_state:
-    st.session_state.history = []  # {"player_id": int, "change": {...}}
+# Stripe success redirect
+qp = st.query_params
+if qp.get("upgraded") == "1":
+    set_user_pro(user_id, True)
+    st.success("✅ Upgrade successful! Pro unlocked.")
+    st.query_params.clear()
+    is_pro = True
 
-roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
+# ============================================================
+# GAMES (keep in sidebar, but “Account” details moved to Account page)
+# ============================================================
+st.sidebar.subheader("Games")
 
-if not roster:
-    set_roster(active_game_id, DEFAULT_ROSTER, STAT_KEYS)
-    roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
+games = list_games(user_id)
+labels = ["➕ New Game"] + [f"{gid}: {name}" for gid, name, _ in games]
+choice = st.sidebar.selectbox("Select game", labels, key="game_select")
 
+st.session_state.setdefault("game_id", None)
 
-# ------------------
-# Sidebar: Roster editing
-# ------------------
-st.sidebar.header("Roster")
-roster_text = st.sidebar.text_area("One player per line", value="\n".join(roster), height=180)
+if choice == "➕ New Game":
+    new_name = st.sidebar.text_input("Game name", "Home vs Away", key="new_game_name")
 
-if st.sidebar.button("Update Roster"):
-    new_roster = [line.strip() for line in roster_text.splitlines() if line.strip()]
-    if not new_roster:
-        new_roster = DEFAULT_ROSTER.copy()
-    set_roster(active_game_id, new_roster, STAT_KEYS)
-    st.session_state.history = []
-    st.toast("Roster updated ✅")
-    st.rerun()
+    tracking_mode = st.sidebar.selectbox(
+        "Tracking mode",
+        ["Both Teams (Full Box Score)", "One Team (Standard)"],
+        index=0,
+        key="tracking_mode_new",
+    )
 
-# Reload after roster change
-roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
+    if st.sidebar.button("Create", key="create_game_btn"):
+        st.session_state.game_id = create_game(user_id, new_name)
 
+        if tracking_mode == "Both Teams (Full Box Score)":
+            combined = [add_prefix("Home", p) for p in DEFAULT_HOME] + [add_prefix("Away", p) for p in DEFAULT_AWAY]
+            set_roster(st.session_state.game_id, combined, STAT_KEYS)
+        else:
+            set_roster(st.session_state.game_id, [add_prefix("Home", p) for p in DEFAULT_HOME], STAT_KEYS)
 
-# ------------------
-# Helpers (undo/reset/change)
-# ------------------
-def record(player_id, change):
-    st.session_state.history.append({"player_id": player_id, "change": change})
-
-def undo():
-    if not st.session_state.history:
-        st.toast("Nothing to undo.", icon="ℹ️")
-        return False
-    last = st.session_state.history.pop()
-    apply_change(active_game_id, last["player_id"], last["change"], direction=-1)
-    return True
-
-def reset_game():
-    roster2, name_to_pid2, player_stats2 = load_game(active_game_id, STAT_KEYS)
-    for name in roster2:
-        pid = name_to_pid2[name]
-        current = player_stats2[name]
-        for k, v in current.items():
-            if v != 0:
-                apply_change(active_game_id, pid, {k: v}, direction=-1)
-    st.session_state.history = []
-
-
-# ------------------
-# LIVE TAB: ENTRY FIRST, TOTALS BELOW + OREB/DREB shown
-# ------------------
-with tab_live:
-    if "selected_player" not in st.session_state or st.session_state.selected_player not in roster:
-        st.session_state.selected_player = roster[0]
-
-    default_index = roster.index(st.session_state.selected_player) if st.session_state.selected_player in roster else 0
-    selected_name = st.selectbox("Selected Player", roster, index=default_index)
-    st.session_state.selected_player = selected_name
-    selected_pid = name_to_pid[selected_name]
-
-    def do_change(change, toast_text):
-        apply_change(active_game_id, selected_pid, change)
-        record(selected_pid, change)
-        st.toast(toast_text, icon="✅")
         st.rerun()
+else:
+    st.session_state.game_id = int(choice.split(":")[0])
 
-    st.subheader("Enter Stats")
-    e1, e2, e3 = st.columns(3)
+if not st.session_state.game_id:
+    st.stop()
 
-    with e1:
-        st.markdown("### Scoring")
-        if st.button("2PT Made"):
-            do_change({"2PM": 1, "2PA": 1}, "2PT made")
-        if st.button("2PT Miss"):
-            do_change({"2PA": 1}, "2PT missed")
-        if st.button("3PT Made"):
-            do_change({"3PM": 1, "3PA": 1}, "3PT made")
-        if st.button("3PT Miss"):
-            do_change({"3PA": 1}, "3PT missed")
-        if st.button("FT Made"):
-            do_change({"FTM": 1, "FTA": 1}, "FT made")
-        if st.button("FT Miss"):
-            do_change({"FTA": 1}, "FT missed")
+gid = st.session_state.game_id
 
-    with e2:
-        st.markdown("### Hustle")
-        if st.button("Offensive Rebound"):
-            do_change({"OREB": 1}, "Offensive rebound")
-        if st.button("Defensive Rebound"):
-            do_change({"DREB": 1}, "Defensive rebound")
-        if st.button("Assist"):
-            do_change({"AST": 1}, "Assist")
+if st.sidebar.button("🗑️ Delete game", key="delete_game_btn"):
+    delete_game(user_id, gid)
+    st.session_state.game_id = None
+    st.rerun()
 
-    with e3:
-        st.markdown("### Mistakes")
-        if st.button("Turnover"):
-            do_change({"TOV": 1}, "Turnover")
+# ============================================================
+# LOAD GAME + ROSTERS
+# ============================================================
+roster, name_to_pid, stats = load_game(gid, STAT_KEYS)
+if not roster:
+    combined = [add_prefix("Home", p) for p in DEFAULT_HOME] + [add_prefix("Away", p) for p in DEFAULT_AWAY]
+    set_roster(gid, combined, STAT_KEYS)
+    roster, name_to_pid, stats = load_game(gid, STAT_KEYS)
 
-        st.divider()
-        if st.button("⬅️ Undo"):
-            if undo():
-                st.toast("Undone ↩️")
+both_mode = is_both_teams_game(roster)
+home_roster = [n for n in roster if team_of(n) == "Home"]
+away_roster = [n for n in roster if team_of(n) == "Away"]
+
+# ============================================================
+# PER-GAME STATE KEYS (avoid widget assignment errors)
+# ============================================================
+live_team_key = f"live_team_{gid}"
+poss_key = f"possession_{gid}"
+period_value_key = f"period_value_{gid}"
+period_widget_key = f"period_widget_{gid}"
+
+sel_value_key = f"selected_player_value_{gid}"
+sel_widget_key = f"selected_player_widget_{gid}"
+
+shortcuts_key = f"shortcuts_{gid}"
+
+player_search_key = f"player_search_{gid}"
+roster_view_key = f"roster_view_{gid}"
+
+log_key = f"log_{gid}"
+undo_key = f"undo_{gid}"
+
+# Seed defaults
+st.session_state.setdefault(live_team_key, "Home")
+st.session_state.setdefault(poss_key, "Home")
+st.session_state.setdefault(period_value_key, "Q1")
+st.session_state.setdefault(shortcuts_key, True)
+st.session_state.setdefault(player_search_key, "")
+st.session_state.setdefault(roster_view_key, "All")
+st.session_state.setdefault(log_key, [])
+st.session_state.setdefault(undo_key, [])
+
+# ============================================================
+# SIDEBAR: NAVIGATION (this fixes “tabs disappear”)
+# Live shows first automatically.
+# ============================================================
+st.sidebar.divider()
+st.sidebar.subheader("Navigate")
+
+nav_items = ["Live", "Summary", "Box Score", "Player", "Export", "Season / Reports", "Account"]
+page = st.sidebar.radio("", nav_items, index=0, key=f"nav_{gid}")
+
+# ============================================================
+# SIDEBAR: ROSTER EDITOR (clean + tucked away)
+# ============================================================
+st.sidebar.divider()
+with st.sidebar.expander("Roster", expanded=False):
+    if both_mode:
+        home_text = st.text_area(
+            "Home (one per line)",
+            value="\n".join([clean_name(n) for n in home_roster]),
+            height=120,
+            key=f"home_roster_text_{gid}",
+        )
+        away_text = st.text_area(
+            "Away (one per line)",
+            value="\n".join([clean_name(n) for n in away_roster]),
+            height=120,
+            key=f"away_roster_text_{gid}",
+        )
+        if st.button("Update Rosters", key=f"update_rosters_{gid}", use_container_width=True):
+            new_home = [add_prefix("Home", x) for x in home_text.splitlines() if x.strip()]
+            new_away = [add_prefix("Away", x) for x in away_text.splitlines() if x.strip()]
+            if not new_home or not new_away:
+                st.error("Both Home and Away rosters must have at least 1 player.")
+            else:
+                set_roster(gid, new_home + new_away, STAT_KEYS)
                 st.rerun()
-        if st.button("🔄 Reset Game"):
-            reset_game()
-            st.toast("Game reset 🔄")
-            st.rerun()
+    else:
+        roster_text = st.text_area(
+            "Home (one per line)",
+            value="\n".join([clean_name(n) for n in home_roster]),
+            height=160,
+            key=f"home_only_roster_text_{gid}",
+        )
+        if st.button("Update Roster", key=f"update_roster_{gid}", use_container_width=True):
+            new_roster = [add_prefix("Home", line.strip()) for line in roster_text.splitlines() if line.strip()]
+            if not new_roster:
+                st.error("Roster cannot be empty.")
+            else:
+                set_roster(gid, new_roster, STAT_KEYS)
+                st.rerun()
+
+# ============================================================
+# SHARED: SCORE COMPUTE
+# ============================================================
+home_score = sum(points(stats[n]) for n in home_roster) if home_roster else 0
+away_score = sum(points(stats[n]) for n in away_roster) if away_roster else 0
+
+# ============================================================
+# ACTION APPLICATION (stats + log + undo) — safe with widgets
+# ============================================================
+pid_to_name = {pid: name for name, pid in name_to_pid.items()}
+
+def _push_log(team: str, player_name: str, change: dict):
+    entry = {
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "period": st.session_state.get(period_value_key, "Q1"),
+        "team": team,
+        "player": clean_name(player_name),
+        "label": nice_change_label(change),
+        "pts": change_points(change),
+    }
+    st.session_state[log_key].append(entry)
+    # cap for performance
+    if len(st.session_state[log_key]) > 500:
+        st.session_state[log_key] = st.session_state[log_key][-500:]
+
+def apply_delta(change: dict, direction: int):
+    """
+    direction: +1 add, -1 subtract
+    """
+    # use controlled selection (value key), not the widget key
+    current_player = st.session_state.get(sel_value_key, None)
+    if not current_player:
+        # fallback
+        current_player = (home_roster[0] if home_roster else roster[0])
+
+    current_pid = name_to_pid.get(current_player)
+    if current_pid is None:
+        return
+
+    apply_change(gid, current_pid, change, direction=direction)
+
+    # undo stack includes whether we also logged
+    did_log = False
+    if direction == +1:
+        _push_log(team_of(current_player), current_player, change)
+        did_log = True
+
+    st.session_state[undo_key].append({
+        "pid": current_pid,
+        "change": change,
+        "dir": direction,
+        "logged": did_log
+    })
+    if len(st.session_state[undo_key]) > 200:
+        st.session_state[undo_key] = st.session_state[undo_key][-200:]
+
+    st.rerun()
+
+def undo_last():
+    stack = st.session_state.get(undo_key, [])
+    if not stack:
+        return
+    last = stack.pop()
+    st.session_state[undo_key] = stack
+
+    apply_change(gid, last["pid"], last["change"], direction=(-1 * last["dir"]))
+
+    # pop log if we created one
+    if last.get("logged") and st.session_state.get(log_key):
+        st.session_state[log_key].pop()
+
+    st.rerun()
+
+# ============================================================
+# PAGE: LIVE (premium scoreboard + possession + runs + log)
+# ============================================================
+if page == "Live":
+    st.header("Live Game Mode")
+    st.caption("Phone-first stat entry. Tap fast. Fix mistakes instantly.")
+
+    # --- Scoreboard row (sleek) ---
+    sb = st.container()
+    with sb:
+        c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.8, 1.2, 1.2])
+
+        with c1:
+            st.metric("HOME", home_score)
+        with c2:
+            st.metric("AWAY", away_score)
+
+        with c3:
+            # Period selector (widget -> value sync)
+            def _sync_period():
+                st.session_state[period_value_key] = st.session_state.get(period_widget_key, "Q1")
+
+            cur = st.session_state.get(period_value_key, "Q1")
+            idx = PERIODS.index(cur) if cur in PERIODS else 0
+            st.selectbox(
+                "Period",
+                PERIODS,
+                index=idx,
+                key=period_widget_key,
+                on_change=_sync_period,
+            )
+
+        with c4:
+            # Possession toggle (premium feel)
+            st.write("")
+            if st.button(
+                "🏀 Poss: HOME" if st.session_state[poss_key] == "Home" else "🏀 Poss: AWAY",
+                key=f"poss_btn_{gid}",
+                use_container_width=True,
+            ):
+                st.session_state[poss_key] = "Away" if st.session_state[poss_key] == "Home" else "Home"
+                st.rerun()
+
+        with c5:
+            st.write("")
+            st.button(
+                "↩️ Undo last",
+                key=f"undo_last_btn_{gid}",
+                use_container_width=True,
+                disabled=len(st.session_state.get(undo_key, [])) == 0,
+                on_click=undo_last,
+            )
+
+    # --- Runs + quick context ---
+    log_entries = st.session_state.get(log_key, [])
+    run_home = runs_from_log(log_entries, "Home", last_n=6)
+    run_away = runs_from_log(log_entries, "Away", last_n=6)
+
+    r1, r2, r3 = st.columns([1.2, 1.2, 1.6])
+    with r1:
+        st.metric("Home run (last 6 scores)", run_home)
+    with r2:
+        st.metric("Away run (last 6 scores)", run_away)
+    with r3:
+        poss = st.session_state.get(poss_key, "Home")
+        st.caption(f"**Possession:** {poss} • **Score:** {format_scoreline(home_score, away_score)}")
 
     st.divider()
 
-    # Refresh from DB after any changes
-    roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
-    ps = player_stats[selected_name]
+    # --- Team toggle if both teams mode ---
+    if both_mode:
+        t1, t2, t3 = st.columns([1.2, 1.2, 3])
+        with t1:
+            if st.button(
+                "🏠 HOME",
+                use_container_width=True,
+                type="primary" if st.session_state[live_team_key] == "Home" else "secondary",
+                key=f"btn_home_{gid}"
+            ):
+                st.session_state[live_team_key] = "Home"
+                st.rerun()
+        with t2:
+            if st.button(
+                "🚌 AWAY",
+                use_container_width=True,
+                type="primary" if st.session_state[live_team_key] == "Away" else "secondary",
+                key=f"btn_away_{gid}"
+            ):
+                st.session_state[live_team_key] = "Away"
+                st.rerun()
+        with t3:
+            st.checkbox("Shortcuts", key=shortcuts_key, help="Turn on/off quick combo buttons.")
+        active_team = st.session_state.get(live_team_key, "Home")
+        active_roster = home_roster if active_team == "Home" else away_roster
+    else:
+        # one-team mode: still use “Home” roster
+        active_team = "Home"
+        active_roster = home_roster if home_roster else roster
+        st.checkbox("Shortcuts", key=shortcuts_key, help="Turn on/off quick combo buttons.")
 
-    # Player totals
-    p_pts = ps["2PM"] * 2 + ps["3PM"] * 3 + ps["FTM"]
-    p_fgm = ps["2PM"] + ps["3PM"]
-    p_fga = ps["2PA"] + ps["3PA"]
-    p_reb = ps["OREB"] + ps["DREB"]
+    # --- Filters row ---
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        st.text_input("Search player", key=player_search_key, placeholder="Type a name…")
+    with f2:
+        st.selectbox("View", ["All"], key=roster_view_key)
 
-    st.subheader(f"{selected_name} – Totals")
-    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-    m1.metric("PTS", p_pts)
-    m2.metric("FG", f"{p_fgm}/{p_fga} ({pct(p_fgm, p_fga)}%)")
-    m3.metric("3PT", f"{ps['3PM']}/{ps['3PA']} ({pct(ps['3PM'], ps['3PA'])}%)")
-    m4.metric("FT", f"{ps['FTM']}/{ps['FTA']} ({pct(ps['FTM'], ps['FTA'])}%)")
-    m5.metric("OREB", ps["OREB"])
-    m6.metric("DREB", ps["DREB"])
-    m7.metric("REB", p_reb)
-    m8.metric("AST", ps["AST"])
+    search_txt = (st.session_state.get(player_search_key, "") or "").strip().lower()
+    filtered_roster = list(active_roster)
+    if search_txt:
+        filtered_roster = [p for p in filtered_roster if search_txt in clean_name(p).lower()]
+    if not filtered_roster:
+        filtered_roster = list(active_roster)
 
-    # Team totals
-    tot = empty_player_stats()
-    for name in roster:
-        for k in STAT_KEYS:
-            tot[k] += player_stats[name][k]
+    # --- Controlled selection keys (prevents session_state widget errors) ---
+    st.session_state.setdefault(sel_value_key, filtered_roster[0] if filtered_roster else (active_roster[0] if active_roster else roster[0]))
 
-    t_pts = tot["2PM"] * 2 + tot["3PM"] * 3 + tot["FTM"]
-    t_fgm = tot["2PM"] + tot["3PM"]
-    t_fga = tot["2PA"] + tot["3PA"]
-    t_reb = tot["OREB"] + tot["DREB"]
+    if st.session_state[sel_value_key] not in filtered_roster and filtered_roster:
+        st.session_state[sel_value_key] = filtered_roster[0]
 
+    def _sync_selected_player():
+        st.session_state[sel_value_key] = st.session_state.get(sel_widget_key, st.session_state[sel_value_key])
+
+    col_players, col_actions = st.columns([1.05, 1.95])
+
+    with col_players:
+        st.subheader(f"{active_team} Players" if both_mode else "Players")
+
+        def _player_label(name: str) -> str:
+            s = stats.get(name, {k: 0 for k in STAT_KEYS})
+            return f"{clean_name(name)} • {points(s)} pts"
+
+        # set radio index based on current value
+        current = st.session_state.get(sel_value_key)
+        idx = filtered_roster.index(current) if current in filtered_roster else 0
+
+        st.radio(
+            "",
+            filtered_roster,
+            index=idx,
+            format_func=_player_label,
+            key=sel_widget_key,
+            on_change=_sync_selected_player,
+            label_visibility="collapsed",
+        )
+
+        # tiny pro tease box (kept)
+        with st.expander("🔒 Pro preview (tap to see what you’ll unlock)", expanded=False):
+            st.write("Season leaderboards • Shareable reports • Team trends • More exports")
+            st.info("Upgrade to Pro from the Account page.")
+
+        # last 10 plays quick view (premium feel, no clock needed)
+        st.caption("Recent plays")
+        recent = list(reversed(log_entries[-10:])) if log_entries else []
+        if recent:
+            for e in recent[:10]:
+                st.write(f"**{e['period']}** • {e['team']} • {e['player']} — {e['label']}")
+        else:
+            st.write("—")
+
+    # Selected player
+    player = st.session_state.get(sel_value_key, filtered_roster[0])
+    s = stats[player]
+
+    with col_actions:
+        # header row: stat strip like you wanted
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("PTS", points(s))
+        m2.metric("FG%", pct(fgm(s), fga(s)))
+        m3.metric("FG", f"{fgm(s)}/{fga(s)}")
+        m4.metric("3PT%", pct(int(s["3PM"]), int(s["3PA"])))
+        m5.metric("FT%", pct(int(s["FTM"]), int(s["FTA"])))
+        m6.metric("REB", total_reb(s))
+
+        st.markdown(
+            f"<div class='subtle'><b>Selected:</b> {clean_name(player)} • Tracking <b>{active_team}</b> • Period: <b>{st.session_state.get(period_value_key,'Q1')}</b></div>",
+            unsafe_allow_html=True
+        )
+        st.divider()
+
+        # helper: plus/minus row
+        def pm_row(label: str, group_key: str, plus_change: dict, minus_change: dict = None):
+            if minus_change is None:
+                minus_change = plus_change
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.button(
+                    label,
+                    key=f"{gid}_{name_to_pid[player]}_{group_key}_plus",
+                    use_container_width=True,
+                    on_click=apply_delta,
+                    args=(plus_change, +1),
+                )
+            with c2:
+                st.button(
+                    "−",
+                    key=f"{gid}_{name_to_pid[player]}_{group_key}_minus",
+                    use_container_width=True,
+                    on_click=apply_delta,
+                    args=(minus_change, -1),
+                )
+
+        # Quick Actions (premium, lightweight)
+        if st.session_state.get(shortcuts_key, True):
+            st.subheader("Quick Actions")
+            qa1, qa2, qa3, qa4 = st.columns(4)
+
+            with qa1:
+                if st.button("And-1 (2+FT)", key=f"qa_and1_{gid}_{name_to_pid[player]}", use_container_width=True):
+                    apply_delta({"2PM": 1, "2PA": 1, "FTM": 1, "FTA": 1}, +1)
+            with qa2:
+                if st.button("3-Foul (3A+FT)", key=f"qa_3foul_{gid}_{name_to_pid[player]}", use_container_width=True):
+                    apply_delta({"3PA": 1, "FTA": 1}, +1)
+            with qa3:
+                if st.button("DREB + AST", key=f"qa_dreb_ast_{gid}_{name_to_pid[player]}", use_container_width=True):
+                    apply_delta({"DREB": 1, "AST": 1}, +1)
+            with qa4:
+                if st.button("OREB + 2PT", key=f"qa_putback_{gid}_{name_to_pid[player]}", use_container_width=True):
+                    apply_delta({"OREB": 1, "2PM": 1, "2PA": 1}, +1)
+
+            st.divider()
+
+        g1, g2, g3 = st.columns([1, 1, 1])
+
+        with g1:
+            st.markdown("## Scoring")
+            pm_row("✅ 2PT Made", "2pm", {"2PM": 1, "2PA": 1})
+            pm_row("❌ 2PT Miss", "2pa", {"2PA": 1})
+            pm_row("✅ 3PT Made", "3pm", {"3PM": 1, "3PA": 1})
+            pm_row("❌ 3PT Miss", "3pa", {"3PA": 1})
+            pm_row("✅ FT Made", "ftm", {"FTM": 1, "FTA": 1})
+            pm_row("❌ FT Miss", "fta", {"FTA": 1})
+
+        with g2:
+            st.markdown("## Hustle")
+            pm_row("OREB +1", "oreb", {"OREB": 1})
+            pm_row("DREB +1", "dreb", {"DREB": 1})
+            pm_row("AST +1", "ast", {"AST": 1})
+            pm_row("TOV +1", "tov", {"TOV": 1})
+            st.write("")
+            st.markdown("## Fouls")
+            pm_row("FOUL +1", "pf", {"PF": 1})
+
+        with g3:
+            st.markdown("## Defense")
+            pm_row("STL +1", "stl", {"STL": 1})
+            pm_row("BLK +1", "blk", {"BLK": 1})
+
+# ============================================================
+# PAGE: SUMMARY (game story + takeaways + leaders)
+# ============================================================
+elif page == "Summary":
+    st.header("Game Summary")
+
+    headline = "Home vs Away"
+    if both_mode:
+        if home_score != away_score:
+            leader = "Home" if home_score > away_score else "Away"
+            headline = f"{leader} leads {format_scoreline(home_score, away_score)}"
+        else:
+            headline = f"Tied {format_scoreline(home_score, away_score)}"
+    else:
+        headline = f"Home score: {home_score}"
+
+    st.subheader(headline)
+
+    # Takeaways chips
+    if both_mode:
+        takeaways = compute_takeaways(home_roster, away_roster, stats)
+        if takeaways:
+            c = st.columns(len(takeaways))
+            for i, t in enumerate(takeaways):
+                with c[i]:
+                    st.info(t)
+        else:
+            st.caption("No takeaways yet — add more stats and this will populate.")
+
+    # Leaders
     st.divider()
-    st.subheader("Team Totals")
-    tm1, tm2, tm3, tm4, tm5, tm6, tm7, tm8 = st.columns(8)
-    tm1.metric("PTS", t_pts)
-    tm2.metric("FG", f"{t_fgm}/{t_fga} ({pct(t_fgm, t_fga)}%)")
-    tm3.metric("3PT", f"{tot['3PM']}/{tot['3PA']} ({pct(tot['3PM'], tot['3PA'])}%)")
-    tm4.metric("FT", f"{tot['FTM']}/{tot['FTA']} ({pct(tot['FTM'], tot['FTA'])}%)")
-    tm5.metric("OREB", tot["OREB"])
-    tm6.metric("DREB", tot["DREB"])
-    tm7.metric("REB", t_reb)
-    tm8.metric("AST", tot["AST"])
+    st.subheader("Leaders")
 
+    if both_mode:
+        lh = leaders_from_roster(home_roster, stats)
+        la = leaders_from_roster(away_roster, stats)
 
-# ------------------
-# BOX SCORE TAB
-# ------------------
-with tab_box:
-    roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
+        left, right = st.columns(2)
+        with left:
+            st.markdown("### Home")
+            st.write(f"**PTS:** {lh['PTS']['name']} — {lh['PTS']['PTS']}")
+            st.write(f"**REB:** {lh['REB']['name']} — {lh['REB']['REB']}")
+            st.write(f"**AST:** {lh['AST']['name']} — {lh['AST']['AST']}")
+        with right:
+            st.markdown("### Away")
+            st.write(f"**PTS:** {la['PTS']['name']} — {la['PTS']['PTS']}")
+            st.write(f"**REB:** {la['REB']['name']} — {la['REB']['REB']}")
+            st.write(f"**AST:** {la['AST']['name']} — {la['AST']['AST']}")
+    else:
+        lh = leaders_from_roster(home_roster, stats)
+        st.write(f"**PTS:** {lh['PTS']['name']} — {lh['PTS']['PTS']}")
+        st.write(f"**REB:** {lh['REB']['name']} — {lh['REB']['REB']}")
+        st.write(f"**AST:** {lh['AST']['name']} — {lh['AST']['AST']}")
 
-    rows = []
-    for name in roster:
-        s = player_stats[name]
-        pts = s["2PM"] * 2 + s["3PM"] * 3 + s["FTM"]
-        fgm = s["2PM"] + s["3PM"]
-        fga = s["2PA"] + s["3PA"]
-        rows.append({
-            "Player": name,
-            "PTS": pts,
-            "FG": f"{fgm}/{fga}",
-            "3PT": f"{s['3PM']}/{s['3PA']}",
-            "FT": f"{s['FTM']}/{s['FTA']}",
-            "OREB": s["OREB"],
-            "DREB": s["DREB"],
-            "REB": s["OREB"] + s["DREB"],
-            "AST": s["AST"],
-            "TOV": s["TOV"],
-        })
+    # Recent plays (shareable story)
+    st.divider()
+    st.subheader("Recent Plays")
+    log_entries = st.session_state.get(log_key, [])
+    if log_entries:
+        df = pd.DataFrame(list(reversed(log_entries[-25:])))
+        st.dataframe(df[["period","team","player","label","pts","ts"]], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No plays yet.")
 
-    st.subheader("Box Score (All Players)")
-    st.dataframe(rows, use_container_width=True)
-    st.caption("HoopStats MVP – Saved Games (SQLite)")
+# ============================================================
+# PAGE: BOX SCORE (clean + sortable + optional “advanced”)
+# ============================================================
+elif page == "Box Score":
+    st.header("Box Score")
 
-
-# ------------------
-# EXPORT TAB (PRO)
-# ------------------
-with tab_export:
-    roster, name_to_pid, player_stats = load_game(active_game_id, STAT_KEYS)
-
-    st.subheader("Export")
-
-    def build_boxscore_rows(roster, player_stats):
+    def build_rows(roster_list, stats):
         out = []
-        for name in roster:
-            s = player_stats[name]
-            pts = s["2PM"] * 2 + s["3PM"] * 3 + s["FTM"]
-            fgm = s["2PM"] + s["3PM"]
-            fga = s["2PA"] + s["3PA"]
+        for name in roster_list:
+            s = stats[name]
             out.append({
-                "Player": name,
-                "PTS": pts,
-                "FGM": fgm,
-                "FGA": fga,
-                "3PM": s["3PM"],
-                "3PA": s["3PA"],
-                "FTM": s["FTM"],
-                "FTA": s["FTA"],
-                "OREB": s["OREB"],
-                "DREB": s["DREB"],
-                "REB": s["OREB"] + s["DREB"],
-                "AST": s["AST"],
-                "TOV": s["TOV"],
+                "Player": clean_name(name),
+                "PTS": points(s),
+                "FG": f"{fgm(s)}/{fga(s)}",
+                "FG%": pct(fgm(s), fga(s)),
+                "3PT": f"{int(s['3PM'])}/{int(s['3PA'])}",
+                "3PT%": pct(int(s["3PM"]), int(s["3PA"])),
+                "FT": f"{int(s['FTM'])}/{int(s['FTA'])}",
+                "FT%": pct(int(s["FTM"]), int(s["FTA"])),
+                "OREB": int(s["OREB"]),
+                "DREB": int(s["DREB"]),
+                "REB": int(s["OREB"]) + int(s["DREB"]),
+                "AST": int(s["AST"]),
+                "TOV": int(s["TOV"]),
+                "STL": int(s["STL"]),
+                "BLK": int(s["BLK"]),
+                "PF": int(s["PF"]),
             })
         return out
 
-    export_rows = build_boxscore_rows(roster, player_stats)
+    adv = st.toggle("Show advanced (eFG%, AST/TO)", value=False, key=f"adv_box_{gid}")
+    sort_by = st.selectbox("Sort by", ["PTS","REB","AST","TOV","STL","BLK","FG%","3PT%","FT%"], index=0, key=f"sort_box_{gid}")
 
-    # CSV
-    csv_buffer = io.StringIO()
-    writer = csv.DictWriter(csv_buffer, fieldnames=export_rows[0].keys())
-    writer.writeheader()
-    writer.writerows(export_rows)
+    if both_mode:
+        left, right = st.columns(2)
 
-    st.download_button(
-        label=("⬇️ Download Box Score (CSV)" if is_pro else "🔒 Download Box Score (CSV) — Pro"),
-        data=csv_buffer.getvalue(),
-        file_name="box_score.csv",
-        mime="text/csv",
-        disabled=not is_pro,
+        with left:
+            st.subheader("Home")
+            home_rows = build_rows(home_roster, stats)
+            dfh = pd.DataFrame(home_rows)
+            if adv:
+                # eFG% = (FGM + 0.5*3PM) / FGA
+                dfh["eFG%"] = dfh.apply(lambda r: pct((r["FG"].split("/")[0] if isinstance(r["FG"], str) else 0), 1), axis=1)
+                # simpler: compute from raw stats again
+                dfh["eFG%"] = [pct(fgm(stats[n]) + 0.5*int(stats[n]["3PM"]), fga(stats[n])) for n in home_roster]
+                dfh["AST/TO"] = [round(int(stats[n]["AST"]) / int(stats[n]["TOV"]), 2) if int(stats[n]["TOV"]) else float(int(stats[n]["AST"])) for n in home_roster]
+            dfh = dfh.sort_values(by=sort_by, ascending=False)
+            st.dataframe(dfh, use_container_width=True, hide_index=True)
+
+        with right:
+            st.subheader("Away")
+            away_rows = build_rows(away_roster, stats)
+            dfa = pd.DataFrame(away_rows)
+            if adv:
+                dfa["eFG%"] = [pct(fgm(stats[n]) + 0.5*int(stats[n]["3PM"]), fga(stats[n])) for n in away_roster]
+                dfa["AST/TO"] = [round(int(stats[n]["AST"]) / int(stats[n]["TOV"]), 2) if int(stats[n]["TOV"]) else float(int(stats[n]["AST"])) for n in away_roster]
+            dfa = dfa.sort_values(by=sort_by, ascending=False)
+            st.dataframe(dfa, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Totals")
+        th = team_totals(home_roster, stats)
+        ta = team_totals(away_roster, stats)
+        totals_rows = [
+            {"Team": "Home", "PTS": points(th), "REB": th["OREB"]+th["DREB"], "AST": th["AST"], "TOV": th["TOV"], "STL": th["STL"], "BLK": th["BLK"]},
+            {"Team": "Away", "PTS": points(ta), "REB": ta["OREB"]+ta["DREB"], "AST": ta["AST"], "TOV": ta["TOV"], "STL": ta["STL"], "BLK": ta["BLK"]},
+        ]
+        st.dataframe(pd.DataFrame(totals_rows), use_container_width=True, hide_index=True)
+
+        # rows for export/reports
+        rows_for_export = home_rows + away_rows
+    else:
+        rows_for_export = build_rows(home_roster if home_roster else roster, stats)
+        df = pd.DataFrame(rows_for_export)
+        if adv:
+            rr = (home_roster if home_roster else roster)
+            df["eFG%"] = [pct(fgm(stats[n]) + 0.5*int(stats[n]["3PM"]), fga(stats[n])) for n in rr]
+            df["AST/TO"] = [round(int(stats[n]["AST"]) / int(stats[n]["TOV"]), 2) if int(stats[n]["TOV"]) else float(int(stats[n]["AST"])) for n in rr]
+        df = df.sort_values(by=sort_by, ascending=False)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# ============================================================
+# PAGE: PLAYER (player profile + last actions)
+# ============================================================
+elif page == "Player":
+    st.header("Player Profile")
+
+    all_players = roster[:] if roster else []
+    if not all_players:
+        st.info("No players yet.")
+        st.stop()
+
+    chosen = st.selectbox("Choose player", all_players, format_func=clean_name, key=f"profile_pick_{gid}")
+    s = stats[chosen]
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("PTS", points(s))
+    p2.metric("REB", total_reb(s))
+    p3.metric("AST", int(s["AST"]))
+    p4.metric("TOV", int(s["TOV"]))
+
+    st.divider()
+    st.subheader("Shooting")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("FG", f"{fgm(s)}/{fga(s)}")
+    a2.metric("3PT", f"{int(s['3PM'])}/{int(s['3PA'])}")
+    a3.metric("FT", f"{int(s['FTM'])}/{int(s['FTA'])}")
+
+    st.caption(
+        f"FG% {pct(fgm(s), fga(s))}% • 3PT% {pct(int(s['3PM']), int(s['3PA']))}% • FT% {pct(int(s['FTM']), int(s['FTA']))}%"
     )
 
     st.divider()
-    st.subheader("Export PDF")
+    st.subheader("Recent Actions")
+    log_entries = st.session_state.get(log_key, [])
+    if log_entries:
+        player_log = [e for e in log_entries if e.get("player") == clean_name(chosen)]
+        if player_log:
+            df = pd.DataFrame(list(reversed(player_log[-50:])))
+            st.dataframe(df[["period","team","label","pts","ts"]], use_container_width=True, hide_index=True)
+        else:
+            st.caption("No logged actions for this player yet.")
+    else:
+        st.caption("No plays logged yet.")
 
-    def build_pdf(roster, player_stats):
+    st.divider()
+    if not is_pro:
+        st.info("🔒 Pro idea: season averages + game-by-game trend for this player.")
+    else:
+        st.success("Pro unlocked ✅ (next step: season trend across games)")
+
+# ============================================================
+# PAGE: EXPORT (Pro)
+# ============================================================
+elif page == "Export":
+    st.header("Export")
+
+    if not is_pro:
+        st.warning("🔒 Pro feature: Export CSV & PDF box scores + printable reports.")
+        st.stop()
+
+    # Build export rows from current game (same as box score build)
+    def export_rows_for(roster_list):
+        out = []
+        for name in roster_list:
+            s = stats[name]
+            out.append({
+                "Player": clean_name(name),
+                "PTS": points(s),
+                "FG": f"{fgm(s)}/{fga(s)}",
+                "FG%": pct(fgm(s), fga(s)),
+                "3PT": f"{int(s['3PM'])}/{int(s['3PA'])}",
+                "3PT%": pct(int(s["3PM"]), int(s["3PA"])),
+                "FT": f"{int(s['FTM'])}/{int(s['FTA'])}",
+                "FT%": pct(int(s["FTM"]), int(s["FTA"])),
+                "OREB": int(s["OREB"]),
+                "DREB": int(s["DREB"]),
+                "REB": int(s["OREB"]) + int(s["DREB"]),
+                "AST": int(s["AST"]),
+                "TOV": int(s["TOV"]),
+                "STL": int(s["STL"]),
+                "BLK": int(s["BLK"]),
+                "PF": int(s["PF"]),
+            })
+        return out
+
+    rows = export_rows_for(home_roster) + (export_rows_for(away_roster) if both_mode else [])
+
+    # CSV
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    st.download_button("⬇️ Download CSV", csv_buf.getvalue(), "box_score.csv", "text/csv", use_container_width=True)
+
+    # PDF
+    def build_pdf():
         styles = getSampleStyleSheet()
-        elements = []
-        elements.append(Paragraph("<b>Box Score</b>", styles["Title"]))
-
-        data = [["Player", "PTS", "FG", "3PT", "FT", "OREB", "DREB", "REB", "AST", "TOV"]]
-        for name in roster:
-            s = player_stats[name]
-            pts = s["2PM"] * 2 + s["3PM"] * 3 + s["FTM"]
-            fgm = s["2PM"] + s["3PM"]
-            fga = s["2PA"] + s["3PA"]
-            data.append([
-                name,
-                pts,
-                f"{fgm}/{fga}",
-                f"{s['3PM']}/{s['3PA']}",
-                f"{s['FTM']}/{s['FTA']}",
-                s["OREB"],
-                s["DREB"],
-                s["OREB"] + s["DREB"],
-                s["AST"],
-                s["TOV"],
-            ])
+        data = [list(rows[0].keys())]
+        for r in rows:
+            data.append(list(r.values()))
 
         table = Table(data, repeatRows=1)
         table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("GRID", (0, 0), (-1, -1), 1, colors.black),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
         ]))
-
-        elements.append(table)
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         doc = SimpleDocTemplate(tmp.name, pagesize=LETTER)
-        doc.build(elements)
+        subtitle = f"Game ID {gid} • {st.session_state.get(period_value_key,'')}".strip()
+        doc.build([
+            Paragraph("HoopStats Box Score", styles["Title"]),
+            Paragraph(subtitle, styles["Normal"]),
+            Spacer(1, 10),
+            table
+        ])
         return tmp.name
 
-    if st.button(("⬇️ Generate PDF" if is_pro else "🔒 Generate PDF — Pro"), disabled=not is_pro):
-        pdf_path = build_pdf(roster, player_stats)
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="Click to download PDF",
-                data=f,
-                file_name="box_score.pdf",
-                mime="application/pdf"
-            )
-        os.remove(pdf_path)
-        st.toast("PDF generated ✅", icon="✅")
+    if st.button("⬇️ Generate PDF", key=f"pdf_{gid}", use_container_width=True):
+        path = build_pdf()
+        with open(path, "rb") as f:
+            st.download_button("Download PDF", f, "box_score.pdf", "application/pdf", use_container_width=True)
+
+# ============================================================
+# PAGE: SEASON / REPORTS (Pro teaser)
+# ============================================================
+elif page == "Season / Reports":
+    st.header("Season / Reports")
+
+    if not is_pro:
+        st.info("🔒 Pro: season totals across games, leaderboards, player averages, share links.")
+        st.caption("Upgrade from the Account page.")
+        st.stop()
+
+    st.success("Pro unlocked ✅ (next step: aggregate totals across games in db.py)")
+    st.caption("When you're ready, we’ll add cross-game aggregation + leaderboards here.")
+
+# ============================================================
+# PAGE: ACCOUNT (clean, no sidebar email clutter)
+# ============================================================
+elif page == "Account":
+    st.header("Account")
+
+    st.write(f"Signed in as **{email_now}**")
+    st.write("Plan: **Pro ✅**" if is_pro else "Plan: **Free**")
+
+    # Stripe upgrade
+    def start_stripe_checkout():
+        if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
+            st.error("Stripe not configured yet. Set STRIPE_SECRET_KEY + STRIPE_PRICE_ID.")
+            return
+
+        stripe.api_key = STRIPE_SECRET_KEY
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            client_reference_id=str(user_id),
+            customer_email=email_now,
+            allow_promotion_codes=True,
+        )
+        st.link_button("Continue to Checkout", session.url, use_container_width=True)
+
+    if not is_pro:
+        st.subheader("Upgrade to Pro")
+        st.write("Exports • Season leaderboards • Shareable reports • Team trends")
+        start_stripe_checkout()
+        st.divider()
+
+    # Share link instructions (Streamlit Community Cloud)
+    st.subheader("Share this with a friend (Streamlit Cloud)")
+    st.write(
+        "When you deploy on Streamlit Community Cloud, your app gets a public URL.\n\n"
+        "Open your deployed app and copy the browser URL — that’s the link to send."
+    )
+    st.caption("Tip: If your friend needs Google login access while the OAuth app is in testing, add them as a Test User in Google OAuth Consent Screen.")
+
+    st.divider()
+    if has_logout:
+        st.button("Log out", key="logout_btn", use_container_width=True, on_click=st.logout)
+    else:
+        st.caption("Logout not available in this environment.")
+
+# ============================================================
+# DONE
+# ============================================================
